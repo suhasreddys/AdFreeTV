@@ -71,7 +71,14 @@ class MainActivity : AppCompatActivity() {
         webView.isFocusableInTouchMode = true
         webView.requestFocus()
 
-        webView.webChromeClient = object : WebChromeClient() {}
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                if (newProgress > 15) {
+                    view?.evaluateJavascript(AdBlocker.INJECTION_SCRIPT, null)
+                }
+            }
+        }
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
@@ -82,6 +89,11 @@ class MainActivity : AppCompatActivity() {
                     return AdBlocker.createEmptyResponse()
                 }
                 return super.shouldInterceptRequest(view, request)
+            }
+
+            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                view?.evaluateJavascript(AdBlocker.INJECTION_SCRIPT, null)
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {

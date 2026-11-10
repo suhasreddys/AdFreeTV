@@ -26,9 +26,6 @@ object AdBlocker {
         "/api/stats/qoe?adformat="
     )
 
-    /**
-     * Checks if a network request should be blocked.
-     */
     fun shouldBlock(request: WebResourceRequest?): Boolean {
         val url = request?.url?.toString()?.lowercase() ?: return false
 
@@ -43,9 +40,6 @@ object AdBlocker {
         return false
     }
 
-    /**
-     * Returns an empty response to neutralize blocked requests cleanly.
-     */
     fun createEmptyResponse(): WebResourceResponse {
         return WebResourceResponse(
             "text/plain",
@@ -59,103 +53,157 @@ object AdBlocker {
 
     /**
      * Combined JavaScript injection:
-     * 1. In-page Fetch/XHR interceptor
-     * 2. Video ad speed-up & auto-skipper
-     * 3. CSS banner & promo hider
+     * 1. Trusted Types compatibility
+     * 2. In-page Fetch interceptor to strip adPlacements from /youtubei/v1/player
+     * 3. CSS hiding of ad banners using textContent (Trusted Types safe)
+     * 4. Multi-level video ad detector, speed-up & auto-skipper
      */
     val INJECTION_SCRIPT: String = """
         (function() {
             if (window.__adBlockerLoaded) return;
             window.__adBlockerLoaded = true;
 
-            // 1. Inject CSS to hide all ad overlays, banners, and companion cards
-            const style = document.createElement('style');
-            style.innerHTML = `
-                .ytp-ad-overlay-container,
-                .ytp-ad-message-container,
-                .video-ads,
-                .ytp-ad-progress,
-                .ytp-ad-progress-list,
-                #player-ads,
-                ytd-promoted-sparkles-web-renderer,
-                ytd-display-ad-renderer,
-                ytd-banner-promo-renderer,
-                .ytd-in-feed-ad-layout-renderer {
-                    display: none !important;
-                    visibility: hidden !important;
-                    opacity: 0 !important;
-                    pointer-events: none !important;
-                }
-            `;
-            document.head ? document.head.appendChild(style) : document.documentElement.appendChild(style);
+            // 1. Setup Trusted Types policy if enforced
+            if (window.trustedTypes && window.trustedTypes.createPolicy && !window.trustedTypes.defaultPolicy) {
+                try {
+                    window.trustedTypes.createPolicy('default', {
+                        createHTML: function(s) { return s; },
+                        createScript: function(s) { return s; },
+                        createScriptURL: function(s) { return s; }
+                    });
+                } catch (e) {}
+            }
 
-            // 2. Continuous ad detector and skipper
+            // 2. Hide ad containers using textContent (Safe with Trusted Types)
+            try {
+                const style = document.createElement('style');
+                style.textContent = `
+                    .ytp-ad-overlay-container,
+                    .ytp-ad-message-container,
+                    .video-ads,
+                    .ytp-ad-progress,
+                    .ytp-ad-progress-list,
+                    #player-ads,
+                    ytd-promoted-sparkles-web-renderer,
+                    ytd-display-ad-renderer,
+                    ytd-banner-promo-renderer,
+                    .ytd-in-feed-ad-layout-renderer,
+                    .ad-showing .html5-video-player {
+                        display: none !important;
+                        visibility: hidden !important;
+                    }
+                `;
+                (document.head || document.documentElement).appendChild(style);
+            } catch (e) {}
+
+            // 3. Hook fetch to strip adPlacements directly from YouTube player responses
+            try {
+                const originalFetch = window.fetch;
+                window.fetch = async function(...args) {
+                    const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
+                    
+                    if (url.includes('/pagead/') || url.includes('doubleclick.net') || url.includes('/api/stats/ads') || url.includes('/youtubei/v1/player/ad_break')) {
+                        return new Response(JSON.stringify({}), {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                        });
+                    }
+
+                    const response = await originalFetch.apply(this, args);
+
+                    if (url.includes('/youtubei/v1/player')) {
+                        try {
+                            const clone = response.clone();
+                            const data = await clone.json();
+                            if (data && (data.adPlacements || data.adSlots || data.playerAds)) {
+                                delete data.adPlacements;
+                                delete data.adSlots;
+                                delete data.playerAds;
+                                return new Response(JSON.stringify(data), {
+                                    status: response.status,
+                                    statusText: response.statusText,
+                                    headers: response.headers
+                                });
+                            }
+                        } catch (err) {}
+                    }
+
+                    return response;
+                };
+            } catch (e) {}
+
+            // 4. Continuous ad scanner & instant skipper
             let wasAdPlaying = false;
             let previousVolume = 1.0;
 
             function processAds() {
-                const video = document.querySelector('video');
-                const adPlayerShowing = document.querySelector('.ad-showing, .ad-interrupting');
-                
-                if (adPlayerShowing && video) {
-                    if (!wasAdPlaying) {
-                        wasAdPlaying = true;
-                        previousVolume = video.muted ? 0 : video.volume;
-                    }
+                try {
+                    const video = document.querySelector('video');
+                    const player = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
 
-                    // Mute audio during ad
-                    video.muted = true;
+                    const isAdShowing = document.querySelector('.ad-showing, .ad-interrupting, .video-ads, [class*="ad-showing"]') !== null;
+                    const isPlayerAd = player && typeof player.getAdState === 'function' && player.getAdState() === 1;
 
-                    // Accelerate playback speed to blow past the ad
-                    try {
-                        video.playbackRate = 16.0;
-                    } catch (e) {}
+                    if ((isAdShowing || isPlayerAd) && video) {
+                        if (!wasAdPlaying) {
+                            wasAdPlaying = true;
+                            previousVolume = video.muted ? 0 : video.volume;
+                        }
 
-                    // Jump directly to the end of the ad clip
-                    if (isFinite(video.duration) && video.duration > 0) {
-                        video.currentTime = video.duration;
-                    }
+                        // Mute audio instantly
+                        video.muted = true;
 
-                    // Click any skip button that becomes visible
-                    const skipSelectors = [
-                        '.ytp-ad-skip-button',
-                        '.ytp-skip-ad-button',
-                        '.ytp-ad-skip-button-modern',
-                        '.videoAdUiSkipButton',
-                        'button[class*="skip-button"]',
-                        'button[id*="skip"]'
-                    ];
+                        // Blast past the ad at maximum playback speed
+                        try {
+                            video.playbackRate = 16.0;
+                        } catch (e) {}
 
-                    for (const selector of skipSelectors) {
-                        const btn = document.querySelector(selector);
-                        if (btn) {
-                            btn.click();
-                            break;
+                        // Try built-in player skip function
+                        if (player && typeof player.skipAd === 'function') {
+                            try { player.skipAd(); } catch (e) {}
+                        }
+
+                        // Fast forward to end of ad
+                        if (video.duration && isFinite(video.duration) && video.duration > 0) {
+                            video.currentTime = video.duration;
+                        } else {
+                            video.currentTime = 999999;
+                        }
+
+                        // Click any skip button that appears
+                        const skipSelectors = [
+                            '.ytp-ad-skip-button',
+                            '.ytp-skip-ad-button',
+                            '.ytp-ad-skip-button-modern',
+                            '.videoAdUiSkipButton',
+                            'button[class*="skip-button"]',
+                            'button[id*="skip"]',
+                            '[aria-label*="Skip"]',
+                            '[aria-label*="skip"]'
+                        ];
+
+                        for (let i = 0; i < skipSelectors.length; i++) {
+                            const btn = document.querySelector(skipSelectors[i]);
+                            if (btn) {
+                                btn.click();
+                                break;
+                            }
+                        }
+                    } else if (wasAdPlaying && video) {
+                        // Content video resumed: restore speed and audio
+                        wasAdPlaying = false;
+                        try {
+                            video.playbackRate = 1.0;
+                        } catch (e) {}
+                        if (previousVolume > 0) {
+                            video.muted = false;
+                            video.volume = previousVolume;
                         }
                     }
-                } else if (wasAdPlaying && video) {
-                    // Video ad finished: restore normal state
-                    wasAdPlaying = false;
-                    video.playbackRate = 1.0;
-                    if (previousVolume > 0) {
-                        video.muted = false;
-                        video.volume = previousVolume;
-                    }
-                }
+                } catch (e) {}
             }
 
-            // Run check every 200ms
-            setInterval(processAds, 200);
-
-            // 3. Network hooks in JavaScript context
-            const originalFetch = window.fetch;
-            window.fetch = function(...args) {
-                const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
-                if (url.includes('/pagead/') || url.includes('doubleclick.net') || url.includes('/api/stats/ads')) {
-                    return Promise.resolve(new Response('', { status: 200 }));
-                }
-                return originalFetch.apply(this, args);
-            };
+            setInterval(processAds, 150);
         })();
     """.trimIndent()
 }
