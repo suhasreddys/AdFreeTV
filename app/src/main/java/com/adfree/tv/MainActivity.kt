@@ -1,6 +1,7 @@
 package com.adfree.tv
 
 import android.annotation.SuppressLint
+import android.graphics.Bitmap
 import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
@@ -71,7 +72,17 @@ class MainActivity : AppCompatActivity() {
         webView.isFocusableInTouchMode = true
         webView.requestFocus()
 
+        // Enable hardware layer & eliminate scrollbar overhead for smooth TV rendering
+        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        webView.isVerticalScrollBarEnabled = false
+        webView.isHorizontalScrollBarEnabled = false
+
         webView.webChromeClient = object : WebChromeClient() {
+            // Suppress default Android WebView gray play icon on videos
+            override fun getDefaultVideoPoster(): Bitmap {
+                return Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+            }
+
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 super.onProgressChanged(view, newProgress)
                 if (newProgress > 15) {
@@ -86,7 +97,7 @@ class MainActivity : AppCompatActivity() {
                 request: WebResourceRequest?
             ): WebResourceResponse? {
                 if (AdBlocker.shouldBlock(request)) {
-                    return AdBlocker.createEmptyResponse()
+                    return AdBlocker.createEmptyResponse(request)
                 }
                 return super.shouldInterceptRequest(view, request)
             }

@@ -6,7 +6,6 @@ import java.io.ByteArrayInputStream
 
 object AdBlocker {
 
-    // Ad tracking and serving domains
     private val blockedDomains = arrayOf(
         "googleads.g.doubleclick.net",
         "pubads.g.doubleclick.net",
@@ -16,7 +15,6 @@ object AdBlocker {
         "static.doubleclick.net"
     )
 
-    // Ad path segments
     private val blockedPaths = arrayOf(
         "/pagead/",
         "/api/stats/ads",
@@ -40,30 +38,45 @@ object AdBlocker {
         return false
     }
 
-    fun createEmptyResponse(): WebResourceResponse {
+    /**
+     * Returns an empty response with valid CORS headers matching the caller's origin.
+     * Prevents browser CORS errors from stalling the YouTube player state machine.
+     */
+    fun createEmptyResponse(request: WebResourceRequest?): WebResourceResponse {
+        val origin = request?.requestHeaders?.get("Origin")
+            ?: request?.requestHeaders?.get("origin")
+            ?: "https://www.youtube.com"
+
+        val headers = mapOf(
+            "Access-Control-Allow-Origin" to origin,
+            "Access-Control-Allow-Credentials" to "true",
+            "Access-Control-Allow-Headers" to "Content-Type, Authorization, X-YouTube-Client-Name, X-YouTube-Client-Version",
+            "Access-Control-Allow-Methods" to "GET, POST, OPTIONS, HEAD"
+        )
+
         return WebResourceResponse(
-            "text/plain",
+            "application/json",
             "UTF-8",
             200,
             "OK",
-            mapOf("Access-Control-Allow-Origin" to "*"),
-            ByteArrayInputStream("".toByteArray())
+            headers,
+            ByteArrayInputStream("{}".toByteArray())
         )
     }
 
     /**
-     * Combined JavaScript injection:
-     * 1. Trusted Types compatibility
-     * 2. In-page Fetch interceptor to strip adPlacements from /youtubei/v1/player
-     * 3. CSS hiding of ad banners using textContent (Trusted Types safe)
-     * 4. Multi-level video ad detector, speed-up & auto-skipper
+     * Optimized injection:
+     * 1. Eliminates default WebView video play button & poster overlays
+     * 2. Non-blocking adPlacements stripper
+     * 3. Precise ad detector (only triggers on ACTUAL active ads, never on the empty .video-ads container)
+     * 4. Auto-kick for instant video playback start
      */
     val INJECTION_SCRIPT: String = """
         (function() {
             if (window.__adBlockerLoaded) return;
             window.__adBlockerLoaded = true;
 
-            // 1. Setup Trusted Types policy if enforced
+            // 1. Trusted Types compatibility
             if (window.trustedTypes && window.trustedTypes.createPolicy && !window.trustedTypes.defaultPolicy) {
                 try {
                     window.trustedTypes.createPolicy('default', {
@@ -74,21 +87,26 @@ object AdBlocker {
                 } catch (e) {}
             }
 
-            // 2. Hide ad containers using textContent (Safe with Trusted Types)
+            // 2. Hide ad banners, overlays, and suppress the default gray media play button
             try {
                 const style = document.createElement('style');
                 style.textContent = `
+                    video::-webkit-media-controls-start-playback-button,
+                    video::-webkit-media-controls-play-button {
+                        display: none !important;
+                        -webkit-appearance: none !important;
+                        opacity: 0 !important;
+                        visibility: hidden !important;
+                    }
                     .ytp-ad-overlay-container,
                     .ytp-ad-message-container,
-                    .video-ads,
                     .ytp-ad-progress,
                     .ytp-ad-progress-list,
                     #player-ads,
                     ytd-promoted-sparkles-web-renderer,
                     ytd-display-ad-renderer,
                     ytd-banner-promo-renderer,
-                    .ytd-in-feed-ad-layout-renderer,
-                    .ad-showing .html5-video-player {
+                    .ytd-in-feed-ad-layout-renderer {
                         display: none !important;
                         visibility: hidden !important;
                     }
@@ -96,14 +114,14 @@ object AdBlocker {
                 (document.head || document.documentElement).appendChild(style);
             } catch (e) {}
 
-            // 3. Hook fetch to strip adPlacements directly from YouTube player responses
+            // 3. Intercept fetch to strip adPlacements before playback starts
             try {
                 const originalFetch = window.fetch;
                 window.fetch = async function(...args) {
                     const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
                     
                     if (url.includes('/pagead/') || url.includes('doubleclick.net') || url.includes('/api/stats/ads') || url.includes('/youtubei/v1/player/ad_break')) {
-                        return new Response(JSON.stringify({}), {
+                        return new Response('{}', {
                             status: 200,
                             headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                         });
@@ -132,7 +150,7 @@ object AdBlocker {
                 };
             } catch (e) {}
 
-            // 4. Continuous ad scanner & instant skipper
+            // 4. Precision ad skipper - ONLY triggers when an ad is ACTUALLY playing
             let wasAdPlaying = false;
             let previousVolume = 1.0;
 
@@ -141,7 +159,10 @@ object AdBlocker {
                     const video = document.querySelector('video');
                     const player = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
 
-                    const isAdShowing = document.querySelector('.ad-showing, .ad-interrupting, .video-ads, [class*="ad-showing"]') !== null;
+                    // Check for active ads using specific active selectors (never match empty .video-ads)
+                    const isAdShowing = document.querySelector(
+                        '#movie_player.ad-showing, #movie_player.ad-interrupting, .ad-showing, .ad-interrupting, .video-ads > *'
+                    ) !== null;
                     const isPlayerAd = player && typeof player.getAdState === 'function' && player.getAdState() === 1;
 
                     if ((isAdShowing || isPlayerAd) && video) {
@@ -150,27 +171,19 @@ object AdBlocker {
                             previousVolume = video.muted ? 0 : video.volume;
                         }
 
-                        // Mute audio instantly
                         video.muted = true;
+                        try { video.playbackRate = 16.0; } catch (e) {}
 
-                        // Blast past the ad at maximum playback speed
-                        try {
-                            video.playbackRate = 16.0;
-                        } catch (e) {}
-
-                        // Try built-in player skip function
                         if (player && typeof player.skipAd === 'function') {
                             try { player.skipAd(); } catch (e) {}
                         }
 
-                        // Fast forward to end of ad
                         if (video.duration && isFinite(video.duration) && video.duration > 0) {
                             video.currentTime = video.duration;
                         } else {
                             video.currentTime = 999999;
                         }
 
-                        // Click any skip button that appears
                         const skipSelectors = [
                             '.ytp-ad-skip-button',
                             '.ytp-skip-ad-button',
@@ -190,11 +203,8 @@ object AdBlocker {
                             }
                         }
                     } else if (wasAdPlaying && video) {
-                        // Content video resumed: restore speed and audio
                         wasAdPlaying = false;
-                        try {
-                            video.playbackRate = 1.0;
-                        } catch (e) {}
+                        try { video.playbackRate = 1.0; } catch (e) {}
                         if (previousVolume > 0) {
                             video.muted = false;
                             video.volume = previousVolume;
@@ -203,7 +213,7 @@ object AdBlocker {
                 } catch (e) {}
             }
 
-            setInterval(processAds, 150);
+            setInterval(processAds, 100);
         })();
     """.trimIndent()
 }
