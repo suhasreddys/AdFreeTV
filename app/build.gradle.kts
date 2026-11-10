@@ -7,12 +7,15 @@ android {
     namespace = "com.adfree.tv"
     compileSdk = 34
 
+    val appVersionName: String = (project.findProperty("appVersionName") as? String) ?: "1.0.6"
+    val appVersionCode: Int = (project.findProperty("appVersionCode") as? String)?.toIntOrNull() ?: 6
+
     defaultConfig {
         applicationId = "com.adfree.tv"
         minSdk = 21
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
