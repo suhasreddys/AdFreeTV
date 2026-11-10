@@ -45,6 +45,9 @@ class MainActivity : AppCompatActivity() {
         } else {
             webView.restoreState(savedInstanceState)
         }
+
+        // Check for updates from GitHub in the background
+        AppUpdater.checkForUpdates(this)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
